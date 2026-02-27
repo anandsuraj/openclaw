@@ -1,16 +1,15 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ImageContent } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
-  SettingsManager,
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
+import type { OpenClawConfig } from "../../../config/config.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
@@ -19,11 +18,7 @@ import type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforePromptBuildResult,
 } from "../../../plugins/types.js";
-import {
-  isCronSessionKey,
-  isSubagentSessionKey,
-  normalizeAgentId,
-} from "../../../routing/session-key.js";
+import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import { resolveSignalReactionLevel } from "../../../signal/reaction-level.js";
 import { resolveTelegramInlineButtonsScope } from "../../../telegram/inline-buttons.js";
 import { resolveTelegramReactionLevel } from "../../../telegram/reaction-level.js";
@@ -47,6 +42,7 @@ import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import { createOllamaStreamFn, OLLAMA_NATIVE_BASE_URL } from "../../ollama-stream.js";
+import { resolveOwnerDisplaySetting } from "../../owner-display.js";
 import {
   isCloudCodeAssistFormatError,
   resolveBootstrapMaxChars,
@@ -55,7 +51,7 @@ import {
   validateGeminiTurns,
 } from "../../pi-embedded-helpers.js";
 import { subscribeEmbeddedPiSession } from "../../pi-embedded-subscribe.js";
-import { applyPiCompactionSettingsFromConfig } from "../../pi-settings.js";
+import { createPreparedEmbeddedPiSettingsManager } from "../../pi-project-settings.js";
 import { toClientToolDefinitions } from "../../pi-tool-definition-adapter.js";
 import { createOpenClawCodingTools, resolveToolLoopDetectionConfig } from "../../pi-tools.js";
 import { resolveSandboxContext } from "../../sandbox.js";
@@ -76,6 +72,8 @@ import {
 } from "../../skills.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
+import { sanitizeToolCallIdsForCloudCodeAssist } from "../../tool-call-id.js";
+import { resolveEffectiveToolFsWorkspaceOnly } from "../../tool-fs-policy.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
 import { isRunnerAbortError } from "../abort.js";
@@ -84,7 +82,6 @@ import { buildEmbeddedExtensionFactories } from "../extensions.js";
 import { applyExtraParamsToAgent } from "../extra-params.js";
 import {
   logToolSchemasForGoogle,
-  sanitizeAntigravityThinkingBlocks,
   sanitizeSessionHistory,
   sanitizeToolsForGoogle,
 } from "../google.js";
@@ -114,6 +111,7 @@ import {
   selectCompactionTimeoutSnapshot,
   shouldFlagCompactionTimeout,
 } from "./compaction-timeout.js";
+import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
@@ -128,54 +126,6 @@ type PromptBuildHookRunner = {
     ctx: PluginHookAgentContext,
   ) => Promise<PluginHookBeforeAgentStartResult | undefined>;
 };
-
-export function injectHistoryImagesIntoMessages(
-  messages: AgentMessage[],
-  historyImagesByIndex: Map<number, ImageContent[]>,
-): boolean {
-  if (historyImagesByIndex.size === 0) {
-    return false;
-  }
-  let didMutate = false;
-
-  for (const [msgIndex, images] of historyImagesByIndex) {
-    // Bounds check: ensure index is valid before accessing
-    if (msgIndex < 0 || msgIndex >= messages.length) {
-      continue;
-    }
-    const msg = messages[msgIndex];
-    if (msg && msg.role === "user") {
-      // Convert string content to array format if needed
-      if (typeof msg.content === "string") {
-        msg.content = [{ type: "text", text: msg.content }];
-        didMutate = true;
-      }
-      if (Array.isArray(msg.content)) {
-        // Check for existing image content to avoid duplicates across turns
-        const existingImageData = new Set(
-          msg.content
-            .filter(
-              (c): c is ImageContent =>
-                c != null &&
-                typeof c === "object" &&
-                c.type === "image" &&
-                typeof c.data === "string",
-            )
-            .map((c) => c.data),
-        );
-        for (const img of images) {
-          // Only add if this image isn't already in the message
-          if (!existingImageData.has(img.data)) {
-            msg.content.push(img);
-            didMutate = true;
-          }
-        }
-      }
-    }
-  }
-
-  return didMutate;
-}
 
 export async function resolvePromptBuildHookResult(params: {
   prompt: string;
@@ -222,6 +172,23 @@ export async function resolvePromptBuildHookResult(params: {
       .filter((value): value is string => Boolean(value))
       .join("\n\n"),
   };
+}
+
+export function resolvePromptModeForSession(sessionKey?: string): "minimal" | "full" {
+  if (!sessionKey) {
+    return "full";
+  }
+  return isSubagentSessionKey(sessionKey) ? "minimal" : "full";
+}
+
+export function resolveAttemptFsWorkspaceOnly(params: {
+  config?: OpenClawConfig;
+  sessionAgentId: string;
+}): boolean {
+  return resolveEffectiveToolFsWorkspaceOnly({
+    cfg: params.config,
+    agentId: params.sessionAgentId,
+  });
 }
 
 function summarizeMessagePayload(msg: AgentMessage): { textChars: number; imageBlocks: number } {
@@ -354,11 +321,21 @@ export async function runEmbeddedAttempt(
 
     const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
 
+    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+      sessionKey: params.sessionKey,
+      config: params.config,
+      agentId: params.agentId,
+    });
+    const effectiveFsWorkspaceOnly = resolveAttemptFsWorkspaceOnly({
+      config: params.config,
+      sessionAgentId,
+    });
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
     const toolsRaw = params.disableTools
       ? []
       : createOpenClawCodingTools({
+          agentId: sessionAgentId,
           exec: {
             ...params.execOverrides,
             elevated: params.bashElevated,
@@ -388,6 +365,7 @@ export async function runEmbeddedAttempt(
           modelAuthMode: resolveModelAuthMode(params.model.provider, params.config),
           currentChannelId: params.currentChannelId,
           currentThreadTs: params.currentThreadTs,
+          currentMessageId: params.currentMessageId,
           replyToMode: params.replyToMode,
           hasRepliedRef: params.hasRepliedRef,
           modelHasVision,
@@ -449,10 +427,6 @@ export async function runEmbeddedAttempt(
             return undefined;
           })()
         : undefined;
-    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
-      sessionKey: params.sessionKey,
-      config: params.config,
-    });
     const sandboxInfo = buildEmbeddedSandboxInfo(sandbox, params.bashElevated);
     const reasoningTagHint = isReasoningTagProvider(params.provider);
     // Resolve channel-specific message actions for system prompt
@@ -494,10 +468,7 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode =
-      isSubagentSessionKey(params.sessionKey) || isCronSessionKey(params.sessionKey)
-        ? "minimal"
-        : "full";
+    const promptMode = resolvePromptModeForSession(params.sessionKey);
     const docsPath = await resolveOpenClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -505,6 +476,7 @@ export async function runEmbeddedAttempt(
       moduleUrl: import.meta.url,
     });
     const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
+    const ownerDisplay = resolveOwnerDisplaySetting(params.config);
 
     const appendPrompt = buildEmbeddedSystemPrompt({
       workspaceDir: effectiveWorkspace,
@@ -512,11 +484,8 @@ export async function runEmbeddedAttempt(
       reasoningLevel: params.reasoningLevel ?? "off",
       extraSystemPrompt: params.extraSystemPrompt,
       ownerNumbers: params.ownerNumbers,
-      ownerDisplay: params.config?.commands?.ownerDisplay,
-      ownerDisplaySecret:
-        params.config?.commands?.ownerDisplaySecret ??
-        params.config?.gateway?.auth?.token ??
-        params.config?.gateway?.remote?.token,
+      ownerDisplay: ownerDisplay.ownerDisplay,
+      ownerDisplaySecret: ownerDisplay.ownerDisplaySecret,
       reasoningTagHint,
       heartbeatPrompt: isDefaultAgent
         ? resolveHeartbeatPrompt(params.config?.agents?.defaults?.heartbeat?.prompt)
@@ -527,6 +496,7 @@ export async function runEmbeddedAttempt(
       workspaceNotes,
       reactionGuidance,
       promptMode,
+      acpEnabled: params.config?.acp?.enabled !== false,
       runtimeInfo,
       messageToolHints,
       sandboxInfo,
@@ -562,7 +532,7 @@ export async function runEmbeddedAttempt(
       tools,
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
-    const systemPromptText = systemPromptOverride();
+    let systemPromptText = systemPromptOverride();
 
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
@@ -608,9 +578,9 @@ export async function runEmbeddedAttempt(
         cwd: effectiveWorkspace,
       });
 
-      const settingsManager = SettingsManager.create(effectiveWorkspace, agentDir);
-      applyPiCompactionSettingsFromConfig({
-        settingsManager,
+      const settingsManager = createPreparedEmbeddedPiSettingsManager({
+        cwd: effectiveWorkspace,
+        agentDir,
         cfg: params.config,
       });
 
@@ -737,6 +707,8 @@ export async function runEmbeddedAttempt(
         params.provider,
         params.modelId,
         params.streamParams,
+        params.thinkLevel,
+        sessionAgentId,
       );
 
       if (cacheTrace) {
@@ -760,6 +732,32 @@ export async function runEmbeddedAttempt(
             return inner(model, context, options);
           }
           const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
+          if (sanitized === messages) {
+            return inner(model, context, options);
+          }
+          const nextContext = {
+            ...(context as unknown as Record<string, unknown>),
+            messages: sanitized,
+          } as unknown;
+          return inner(model, nextContext as typeof context, options);
+        };
+      }
+
+      // Mistral (and other strict providers) reject tool call IDs that don't match their
+      // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
+      // historical messages at attempt start, but the agent loop's internal tool call →
+      // tool result cycles bypass that path. Wrap streamFn so every outbound request
+      // sees sanitized tool call IDs.
+      if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
+        const inner = activeSession.agent.streamFn;
+        const mode = transcriptPolicy.toolCallIdMode;
+        activeSession.agent.streamFn = (model, context, options) => {
+          const ctx = context as unknown as { messages?: unknown };
+          const messages = ctx?.messages;
+          if (!Array.isArray(messages)) {
+            return inner(model, context, options);
+          }
+          const sanitized = sanitizeToolCallIdsForCloudCodeAssist(messages as AgentMessage[], mode);
           if (sanitized === messages) {
             return inner(model, context, options);
           }
@@ -982,13 +980,7 @@ export async function runEmbeddedAttempt(
       }
 
       // Hook runner was already obtained earlier before tool creation
-      const hookAgentId =
-        typeof params.agentId === "string" && params.agentId.trim()
-          ? normalizeAgentId(params.agentId)
-          : resolveSessionAgentIds({
-              sessionKey: params.sessionKey,
-              config: params.config,
-            }).sessionAgentId;
+      const hookAgentId = sessionAgentId;
 
       let promptError: unknown = null;
       let promptErrorSource: "prompt" | "compaction" | null = null;
@@ -1019,6 +1011,13 @@ export async function runEmbeddedAttempt(
               `hooks: prepended context to prompt (${hookResult.prependContext.length} chars)`,
             );
           }
+          const legacySystemPrompt =
+            typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
+          if (legacySystemPrompt) {
+            applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
+            systemPromptText = legacySystemPrompt;
+            log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
+          }
         }
 
         log.debug(`embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`);
@@ -1036,10 +1035,7 @@ export async function runEmbeddedAttempt(
             sessionManager.resetLeaf();
           }
           const sessionContext = sessionManager.buildSessionContext();
-          const sanitizedOrphan = transcriptPolicy.sanitizeThinkingSignatures
-            ? sanitizeAntigravityThinkingBlocks(sessionContext.messages)
-            : sessionContext.messages;
-          activeSession.agent.replaceMessages(sanitizedOrphan);
+          activeSession.agent.replaceMessages(sessionContext.messages);
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,
@@ -1047,18 +1043,23 @@ export async function runEmbeddedAttempt(
         }
 
         try {
+          // Idempotent cleanup for legacy sessions with persisted image payloads.
+          // Called each run; only mutates already-answered user turns that still carry image blocks.
+          const didPruneImages = pruneProcessedHistoryImages(activeSession.messages);
+          if (didPruneImages) {
+            activeSession.agent.replaceMessages(activeSession.messages);
+          }
+
           // Detect and load images referenced in the prompt for vision-capable models.
-          // This eliminates the need for an explicit "view" tool call by injecting
-          // images directly into the prompt when the model supports it.
-          // Also scans conversation history to enable follow-up questions about earlier images.
+          // Images are prompt-local only (pi-like behavior).
           const imageResult = await detectAndLoadPromptImages({
             prompt: effectivePrompt,
             workspaceDir: effectiveWorkspace,
             model: params.model,
             existingImages: params.images,
-            historyMessages: activeSession.messages,
             maxBytes: MAX_IMAGE_BYTES,
             maxDimensionPx: resolveImageSanitizationLimits(params.config).maxDimensionPx,
+            workspaceOnly: effectiveFsWorkspaceOnly,
             // Enforce sandbox path restrictions when sandbox is enabled
             sandbox:
               sandbox?.enabled && sandbox?.fsBridge
@@ -1066,21 +1067,10 @@ export async function runEmbeddedAttempt(
                 : undefined,
           });
 
-          // Inject history images into their original message positions.
-          // This ensures the model sees images in context (e.g., "compare to the first image").
-          const didMutate = injectHistoryImagesIntoMessages(
-            activeSession.messages,
-            imageResult.historyImagesByIndex,
-          );
-          if (didMutate) {
-            // Persist message mutations (e.g., injected history images) so we don't re-scan/reload.
-            activeSession.agent.replaceMessages(activeSession.messages);
-          }
-
           cacheTrace?.recordStage("prompt:images", {
             prompt: effectivePrompt,
             messages: activeSession.messages,
-            note: `images: prompt=${imageResult.images.length} history=${imageResult.historyImagesByIndex.size}`,
+            note: `images: prompt=${imageResult.images.length}`,
           });
 
           // Diagnostic: log context sizes before prompt to help debug early overflow errors.
@@ -1097,7 +1087,6 @@ export async function runEmbeddedAttempt(
                 `historyImageBlocks=${sessionSummary.totalImageBlocks} ` +
                 `systemPromptChars=${systemLen} promptChars=${promptLen} ` +
                 `promptImages=${imageResult.images.length} ` +
-                `historyImageMessages=${imageResult.historyImagesByIndex.size} ` +
                 `provider=${params.provider}/${params.modelId} sessionFile=${params.sessionFile}`,
             );
           }
@@ -1172,13 +1161,15 @@ export async function runEmbeddedAttempt(
           }
         }
 
+        const compactionOccurredThisAttempt = getCompactionCount() > 0;
+
         // Append cache-TTL timestamp AFTER prompt + compaction retry completes.
         // Previously this was before the prompt, which caused a custom entry to be
         // inserted between compaction and the next prompt — breaking the
         // prepareCompaction() guard that checks the last entry type, leading to
         // double-compaction. See: https://github.com/openclaw/openclaw/issues/9282
         // Skip when timed out during compaction — session state may be inconsistent.
-        if (!timedOutDuringCompaction) {
+        if (!timedOutDuringCompaction && !compactionOccurredThisAttempt) {
           const shouldTrackCacheTtl =
             params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
             isCacheTtlEligibleProvider(params.provider, params.modelId);
@@ -1210,7 +1201,7 @@ export async function runEmbeddedAttempt(
         messagesSnapshot = snapshotSelection.messagesSnapshot;
         sessionIdUsed = snapshotSelection.sessionIdUsed;
 
-        if (promptError && promptErrorSource === "prompt") {
+        if (promptError && promptErrorSource === "prompt" && !compactionOccurredThisAttempt) {
           try {
             sessionManager.appendCustomEntry("openclaw:prompt-error", {
               timestamp: Date.now(),

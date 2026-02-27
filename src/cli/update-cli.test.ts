@@ -200,6 +200,26 @@ describe("update-cli", () => {
       ...overrides,
     }) as UpdateRunResult;
 
+  const runRestartFallbackScenario = async (params: { daemonInstall: "ok" | "fail" }) => {
+    vi.mocked(runGatewayUpdate).mockResolvedValue(makeOkUpdateResult());
+    if (params.daemonInstall === "fail") {
+      vi.mocked(runDaemonInstall).mockRejectedValueOnce(new Error("refresh failed"));
+    } else {
+      vi.mocked(runDaemonInstall).mockResolvedValue(undefined);
+    }
+    prepareRestartScript.mockResolvedValue(null);
+    serviceLoaded.mockResolvedValue(true);
+    vi.mocked(runDaemonRestart).mockResolvedValue(true);
+
+    await updateCommand({});
+
+    expect(runDaemonInstall).toHaveBeenCalledWith({
+      force: true,
+      json: undefined,
+    });
+    expect(runDaemonRestart).toHaveBeenCalled();
+  };
+
   const setupNonInteractiveDowngrade = async () => {
     const tempDir = createCaseDir("openclaw-update");
     setTty(false);
@@ -352,6 +372,23 @@ describe("update-cli", () => {
 
     expect(runGatewayUpdate).toHaveBeenCalled();
     expect(defaultRuntime.log).toHaveBeenCalled();
+  });
+
+  it("updateCommand --dry-run previews without mutating", async () => {
+    vi.mocked(defaultRuntime.log).mockClear();
+    serviceLoaded.mockResolvedValue(true);
+
+    await updateCommand({ dryRun: true, channel: "beta" });
+
+    expect(writeConfigFile).not.toHaveBeenCalled();
+    expect(runGatewayUpdate).not.toHaveBeenCalled();
+    expect(runDaemonInstall).not.toHaveBeenCalled();
+    expect(runRestartScript).not.toHaveBeenCalled();
+    expect(runDaemonRestart).not.toHaveBeenCalled();
+
+    const logs = vi.mocked(defaultRuntime.log).mock.calls.map((call) => String(call[0]));
+    expect(logs.join("\n")).toContain("Update dry-run");
+    expect(logs.join("\n")).toContain("No changes were applied.");
   });
 
   it("updateStatusCommand prints table output", async () => {
@@ -552,49 +589,11 @@ describe("update-cli", () => {
   });
 
   it("updateCommand falls back to restart when env refresh install fails", async () => {
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(runDaemonInstall).mockRejectedValueOnce(new Error("refresh failed"));
-    prepareRestartScript.mockResolvedValue(null);
-    serviceLoaded.mockResolvedValue(true);
-    vi.mocked(runDaemonRestart).mockResolvedValue(true);
-
-    await updateCommand({});
-
-    expect(runDaemonInstall).toHaveBeenCalledWith({
-      force: true,
-      json: undefined,
-    });
-    expect(runDaemonRestart).toHaveBeenCalled();
+    await runRestartFallbackScenario({ daemonInstall: "fail" });
   });
 
   it("updateCommand falls back to restart when no detached restart script is available", async () => {
-    const mockResult: UpdateRunResult = {
-      status: "ok",
-      mode: "git",
-      steps: [],
-      durationMs: 100,
-    };
-
-    vi.mocked(runGatewayUpdate).mockResolvedValue(mockResult);
-    vi.mocked(runDaemonInstall).mockResolvedValue(undefined);
-    prepareRestartScript.mockResolvedValue(null);
-    serviceLoaded.mockResolvedValue(true);
-    vi.mocked(runDaemonRestart).mockResolvedValue(true);
-
-    await updateCommand({});
-
-    expect(runDaemonInstall).toHaveBeenCalledWith({
-      force: true,
-      json: undefined,
-    });
-    expect(runDaemonRestart).toHaveBeenCalled();
+    await runRestartFallbackScenario({ daemonInstall: "ok" });
   });
 
   it("updateCommand does not refresh service env when --no-restart is set", async () => {
@@ -635,14 +634,6 @@ describe("update-cli", () => {
     } finally {
       randomSpy.mockRestore();
     }
-  });
-
-  it("updateCommand skips restart when --no-restart is set", async () => {
-    vi.mocked(runGatewayUpdate).mockResolvedValue(makeOkUpdateResult());
-
-    await updateCommand({ restart: false });
-
-    expect(runDaemonRestart).not.toHaveBeenCalled();
   });
 
   it("updateCommand skips success message when restart does not run", async () => {
@@ -720,6 +711,16 @@ describe("update-cli", () => {
       shouldExit,
     );
     expect(vi.mocked(runGatewayUpdate).mock.calls.length > 0).toBe(shouldRunUpdate);
+  });
+
+  it("dry-run bypasses downgrade confirmation checks in non-interactive mode", async () => {
+    await setupNonInteractiveDowngrade();
+    vi.mocked(defaultRuntime.exit).mockClear();
+
+    await updateCommand({ dryRun: true });
+
+    expect(vi.mocked(defaultRuntime.exit).mock.calls.some((call) => call[0] === 1)).toBe(false);
+    expect(runGatewayUpdate).not.toHaveBeenCalled();
   });
 
   it("updateWizardCommand requires a TTY", async () => {

@@ -8,6 +8,9 @@ import { makeIrcMessageId } from "./protocol.js";
 import { getIrcRuntime } from "./runtime.js";
 import type { CoreConfig, IrcInboundMessage } from "./types.js";
 
+// Track active IRC connections per account to prevent duplicates
+const activeIrcConnections = new Map<string, { client: IrcClient; controller: AbortController }>();
+
 export type IrcMonitorOptions = {
   accountId?: string;
   config?: CoreConfig;
@@ -38,6 +41,22 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
     cfg,
     accountId: opts.accountId,
   });
+
+    const accountId = account.accountId;
+
+  // Check if connection already exists for this account to prevent duplicates
+  if (activeIrcConnections.has(accountId)) {
+    const existingEntry = activeIrcConnections.get(accountId)!;
+    core.logging.getChildLogger().warn(
+      `[${accountId}] IRC connection already active, reusing existing connection`
+    );
+    return {
+      stop: () => {
+        existingEntry.client.quit("shutdown");
+        activeIrcConnections.delete(accountId);
+      },
+    };
+  }
 
   const runtime: RuntimeEnv =
     opts.runtime ??
@@ -133,6 +152,15 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
     }),
   );
 
+
+      // Create abort controller for this connection lifecycle
+    const connectionAbortController = new AbortController();
+    if (opts.abortSignal) {
+      opts.abortSignal.addEventListener("abort", () => connectionAbortController.abort());
+    }
+
+    // Register this connection as active to prevent duplicates
+    activeIrcConnections.set(accountId, { client, controller: connectionAbortController });
   logger.info(
     `[${account.accountId}] connected to ${account.host}:${account.port}${account.tls ? " (tls)" : ""} as ${client.nick}`,
   );
@@ -140,6 +168,8 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
   return {
     stop: () => {
       client?.quit("shutdown");
+            connectionAbortController.abort();
+      activeIrcConnections.delete(accountId);
       client = null;
     },
   };
